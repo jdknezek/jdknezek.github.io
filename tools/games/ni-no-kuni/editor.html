@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html ng-app>
+  <head>
+    <title>Ni no Kuni Save Editor</title>
+    <link rel="stylesheet" href="http://necolas.github.com/normalize.css/2.1.0/normalize.css"/>
+    <style>
+      html {
+        padding: 1em;
+      }
+
+      table {
+        font-size: 0.8em;
+      }
+
+      th, td {
+        padding: 0.25em;
+      }
+
+      td, input[type='number'] {
+        text-align: right;
+      }
+
+      td.non-numeric {
+        text-align: left;
+      }
+
+      .even td {
+        background: #eee;
+      }
+
+      input.ng-dirty, select.ng-dirty {
+        background-color: #ee0;
+      }
+    </style>
+    <script src="http://code.jquery.com/jquery.js"></script>
+    <script src="http://ajax.googleapis.com/ajax/libs/angularjs/1.0.5/angular.js"></script>
+    <script>
+      function View(buffer, byteOffset, byteLength) {
+        if (byteOffset == null) {
+          byteOffset = 0
+        }
+
+        if (byteLength == null) {
+          byteLength = buffer.byteLength
+        }
+
+        this.dataView = new DataView(buffer, byteOffset, byteLength)
+        this.offset = 0
+      }
+
+      View.prototype.slice = function (offset, length) {
+        return new View(this.dataView.buffer, this.dataView.byteOffset + offset, length)
+      }
+
+      ;(function () {
+        var getPattern = /^get.*?(\d+)$/,
+            setPattern = /^set.*?(\d+)$/
+
+        for (var key in DataView.prototype) {
+          var match = key.match(getPattern)
+          if (match) {
+            View.prototype[key] = (function (method, offset) {
+              return function (littleEndian) {
+                try {
+                  var result = method.call(this.dataView, this.offset, littleEndian)
+                  this.offset += offset
+                  return result
+                } catch (e) {
+                  throw e
+                }
+              }
+            })(DataView.prototype[match[0]], parseInt(match[1]) / 8)
+          } else if (match = key.match(setPattern)) {
+            View.prototype[key] = (function (method, offset) {
+              return function (value, littleEndian) {
+                try {
+                  method.call(this.dataView, this.offset, value, littleEndian)
+                  this.offset += offset
+                } catch (e) {
+                  throw e
+                }
+              }
+            })(DataView.prototype[match[0]], parseInt(match[1]) / 8)
+          }
+        }
+      })()
+
+      function App($scope) {
+        $scope.load = function () {
+          var reader = new FileReader
+
+          reader.onloadend = function () {
+            $scope.$apply(function () {
+              parseBlocks(new View(reader.result))
+            })
+          }
+
+          reader.readAsArrayBuffer($('#file')[0].files[0])
+        }
+
+        $scope.snap = function (human, stat) {
+          var stat = human[stat]
+
+          if (stat.current > stat.max) {
+            stat.current = stat.max
+          }
+        }
+
+        $scope.save = function (e) {
+          for (var i = 0, l = $scope.humans.length; i < l; i++) {
+            $scope.humans[i].save()
+          }
+
+          for (var i = 0, l = $scope.familiars.length; i < l; i++) {
+            $scope.familiars[i].save()
+          }
+
+          $(e.target).attr('href', URL.createObjectURL(new Blob([$scope.view.dataView], {type: 'application/octet-stream'})))
+        }
+
+        $scope.stats = ['attack', 'defense', 'magAtk', 'magDef', 'accuracy', 'evasion']
+
+        // In the save file, accuracy and evasion are switched
+        var stats = $scope.stats.slice(0, 4).concat($scope.stats[5], $scope.stats[4])
+
+        $scope.titles = {
+          attack: 'Attack',
+          defense: 'Defense',
+          magAtk: 'Mag. Atk.',
+          magDef: 'Mag. Def.',
+          accuracy: 'Accuracy',
+          evasion: 'Evasion'
+        }
+
+        $scope.signs = [
+          {value: 1, label: 'Sun'},
+          {value: 2, label: 'Star'},
+          {value: 3, label: 'Moon'},
+          {value: 4, label: 'Planet'},
+          {value: 5, label: 'Double Sun'},
+          {value: 6, label: 'Double Star'},
+          {value: 7, label: 'Double Moon'},
+          {value: 8, label: 'Double Planet'}
+        ]
+
+        function parseBlocks(view) {
+          if (view.getUint8() != 0xff) {
+            alert('Unknown file contents. Is this a descrypted SYS-DATA file?')
+            return
+          }
+
+          $scope.view = view
+          // $scope.inventory = []
+          $scope.humans = []
+          $scope.familiars = []
+
+          var lastByte = -1,
+              blockStart,
+              blockType
+
+          while (view.offset < view.dataView.byteLength) {
+            var currentByte = view.getUint8()
+
+            if (lastByte == 0xff && currentByte == 0xfe) {
+              blockStart = view.offset
+              blockType = view.getUint8()
+            } else if (lastByte == 0xfe && currentByte == 0xff) {
+              var blockLength = view.offset - blockStart - 1
+
+              switch (blockType) {
+                // case 0x1b: parseInventory(new View(view.buffer, blockStart, blockLength)); break
+                case 0x0a: $scope.humans.push(Human.parse(view.slice(blockStart, blockLength))); break
+                case 0x0d: $scope.familiars.push(Familiar.parse(view.slice(blockStart, blockLength))); break
+              }
+            }
+
+            lastByte = currentByte
+          }
+
+          function byName(a, b) {
+            if (a.name === b.name) {
+              return 0
+            } else if (a.name < b.name) {
+              return -1
+            } else {
+              return 1
+            }
+          }
+
+          $scope.humans.sort(byName)
+          $scope.familiars.sort(byName)
+        }
+
+        function Human(view) {
+          this.view = view
+          this.hp = {}
+          this.mp = {}
+        }
+
+        Human.parse = function (view) {
+          var currentByte = -1,
+              human = new Human(view),
+              name = ''
+
+          view.offset = 0x12
+
+          while ((currentByte = view.getUint8()) != 0) {
+            name += String.fromCharCode(currentByte)
+          }
+
+          human.name = name
+
+          view.offset = 0x32
+
+          human.exp = view.getUint32()
+          human.lv = view.getUint16()
+          human.hp.current = view.getUint16()
+          human.hp.max = view.getUint16()
+          human.mp.current = view.getUint16()
+          human.mp.max = view.getUint16()
+
+          for (var i = 0, l = stats.length; i < l; i++) {
+            human[stats[i]] = view.getUint16()
+          }
+
+          return human
+        }
+
+        Human.prototype.save = function () {
+          var view = this.view
+
+          view.offset = 0x32
+
+          view.setUint32(this.exp)
+          view.setUint16(this.lv)
+          view.setUint16(this.hp.current)
+          view.setUint16(this.hp.max)
+          view.setUint16(this.mp.current)
+          view.setUint16(this.mp.max)
+
+          for (var i = 0, l = stats.length; i < l; i++) {
+            view.setUint16(this[stats[i]])
+          }
+        }
+
+        function Familiar(view) {
+          this.view = view
+          this.current = {}
+          this.metamorph = {}
+          this.growth1 = {}
+          this.growth2 = {}
+          this.bonus = {}
+        }
+
+        Familiar.parse = function (view) {
+          var currentByte = -1,
+              familiar = new Familiar(view),
+              name = ''
+
+          view.offset = 0xc
+
+          familiar.captureSequence = view.getUint16()
+
+          view.offset = 0x12
+
+          while ((currentByte = view.getUint8()) != 0) {
+            name += String.fromCharCode(currentByte)
+          }
+
+          familiar.name = name
+
+          view.offset = 0x32
+
+          familiar.exp = view.getUint32()
+          familiar.lv = view.getUint16()
+
+          view.offset = 0x40
+
+          for (var i = 0, l = stats.length; i < l; i++) {
+            familiar.current[stats[i]] = view.getUint16()
+          }
+
+          view.offset = 0xba
+
+          var bonuses = ['metamorph', 'growth1', 'growth2']
+          for (var i = 0, l = bonuses.length; i < l; i++) {
+            for (var j = 0, m = stats.length; j < m; j++) {
+              familiar[bonuses[i]][stats[j]] = view.getUint16()
+            }
+          }
+
+          view.offset = 0xe2
+
+          familiar.sign = view.getUint8()
+
+          view.offset = 0xea
+
+          for (var i = 0, l = stats.length; i < l; i++) {
+            familiar.bonus[stats[i]] = view.getUint8()
+            view.offset += 3
+          }
+
+          view.offset = 0x106
+
+          familiar.fullness = view.getUint16() / 1000
+
+          view.offset = 0x10c
+
+          familiar.familiarity = view.getUint8()
+
+          return familiar
+        }
+
+        Familiar.prototype.save = function () {
+          this.view.offset = 0x32
+
+          this.view.setUint32(this.exp)
+          this.view.setUint16(this.lv)
+
+          this.view.offset = 0x40
+
+          for (var i = 0, l = stats.length; i < l; i++) {
+            this.view.setUint16(this.current[stats[i]])
+          }
+
+          this.view.offset = 0xba
+
+          var bonuses = ['metamorph', 'growth1', 'growth2']
+          for (var i = 0, l = bonuses.length; i < l; i++) {
+            for (var j = 0, m = stats.length; j < m; j++) {
+              this.view.setUint16(this[bonuses[i]][stats[j]])
+            }
+          }
+
+          this.view.offset = 0xe2
+
+          this.view.setUint8(this.sign)
+
+          this.view.offset = 0xea
+
+          for (var i = 0, l = stats.length; i < l; i++) {
+            this.view.setUint8(this.bonus[stats[i]])
+            this.view.offset += 3
+          }
+
+          this.view.offset = 0x106
+
+          this.view.setUint16(this.fullness / 1000)
+
+          this.view.offset = 0x10c
+
+          this.view.setUint8(this.familiarity)
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <form ng-controller="App" name="form">
+      <input id="file" type="file"/><br/>
+      <button ng-click="load()">Load</button><br/>
+      <div ng-show="view">
+        <input type="checkbox" id="editing" ng-model="editing"/> <label for="editing">Edit</label><br/>
+        <a download="SYS-DATA" ng-click="save($event)" href="#">Save</a>
+      </div>
+
+      <h3>Humans:</h3>
+      <table>
+        <thead>
+          <tr>
+            <th colspan="3"></th>
+            <th colspan="2">HP</th>
+            <th colspan="2">MP</th>
+            <th colspan="6"></th>
+          </tr>
+          <tr>
+            <th>Name</th>
+            <th>Exp.</th>
+            <th>Lv.</th>
+            <th>Current</th>
+            <th>Max</th>
+            <th>Current</th>
+            <th>Max</th>
+            <th ng-repeat="stat in stats">{{titles[stat]}}</th>
+        </thead>
+        <tbody>
+          <tr ng-repeat="human in humans" ng-class-even="'even'">
+            <td class="non-numeric">{{human.name}}</td>
+            <td>
+              <span ng-hide="editing">{{human.exp}}</span>
+              <input type="number" ng-show="editing" ng-model="human.exp" min="0" max="99999999"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{human.lv}}</span>
+              <input type="number" ng-show="editing" ng-model="human.lv" min="1" max="99"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{human.hp.current}}</span>
+              <input type="number" ng-show="editing" ng-model="human.hp.current" min="0" max="{{human.hp.max}}"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{human.hp.max}}</span>
+              <input type="number" ng-show="editing" ng-model="human.hp.max" min="1" max="999" ng-change="snap(human, 'hp')"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{human.mp.current}}</span>
+              <input type="number" ng-show="editing" ng-model="human.mp.current" min="0" max="{{human.mp.max}}"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{human.mp.max}}</span>
+              <input type="number" ng-show="editing" ng-model="human.mp.max" min="1" max="999" ng-change="snap(human, 'mp')"/>
+            </td>
+            <td ng-repeat="stat in stats">
+              <span ng-hide="editing">{{human[stat]}}</span>
+              <input type="number" ng-show="editing" ng-model="human[stat]" min="1" max="999"/>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Familiars:</h3>
+      <table>
+        <thead>
+          <tr>
+            <th colspan="6"></th>
+            <th colspan="6">Current</th>
+            <th colspan="6">Metamorph</th>
+            <th colspan="6">Growth 1</th>
+            <th colspan="6">Growth 2</th>
+            <th colspan="6">Bonus</th>
+          </tr>
+          <tr>
+            <th>Name</th>
+            <th>Exp.</th>
+            <th>Lv.</th>
+            <th>Sign</th>
+            <th>Fullness</th>
+            <th>Familiarity</th>
+            <th ng-repeat="stat in stats">{{titles[stat]}}</th>
+            <th ng-repeat="stat in stats">{{titles[stat]}}</th>
+            <th ng-repeat="stat in stats">{{titles[stat]}}</th>
+            <th ng-repeat="stat in stats">{{titles[stat]}}</th>
+            <th ng-repeat="stat in stats">{{titles[stat]}}</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr ng-repeat="familiar in familiars" ng-class-even="'even'">
+            <td class="non-numeric">{{familiar.name}}</td>
+            <td>
+              <span ng-hide="editing">{{familiar.exp}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.exp" min="0" max="99999999"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{familiar.lv}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.lv" min="1" max="99"/>
+            </td>
+            <td class="non-numeric">
+              <span ng-hide="editing">{{signs[familiar.sign - 1].label}}</span>
+              <select ng-show="editing" ng-model="familiar.sign" ng-options="sign.value as sign.label for sign in signs"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{familiar.fullness}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.fullness" min="0" max="10"/>
+            </td>
+            <td>
+              <span ng-hide="editing">{{familiar.familiarity}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.familiarity" min="1" max="5"/>
+            </td>
+            <td ng-repeat="stat in stats">
+              <span ng-hide="editing">{{familiar.current[stat]}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.current[stat]" min="1" max="999"/>
+            </td>
+            <td ng-repeat="stat in stats">
+              <span ng-hide="editing">{{familiar.metamorph[stat]}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.metamorph[stat]" min="0" max="65535"/>
+            </td>
+            <td ng-repeat="stat in stats">
+              <span ng-hide="editing">{{familiar.growth1[stat]}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.growth1[stat]" min="0" max="65535"/>
+            </td>
+            <td ng-repeat="stat in stats">
+              <span ng-hide="editing">{{familiar.growth2[stat]}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.growth2[stat]" min="0" max="65535"/>
+            </td>
+            <td ng-repeat="stat in stats">
+              <span ng-hide="editing">{{familiar.bonus[stat]}}</span>
+              <input type="number" ng-show="editing" ng-model="familiar.bonus[stat]" min="0" max="65535"/>
+            </td>
+        </tbody>
+      </table>
+    </form>
+  </body>
+</html>
